@@ -207,7 +207,6 @@ typedef struct
 	CRITICAL_SECTION lock;
 	SCARDCONTEXT hContext;
 	DWORD dwCardHandleCount;
-	BOOL isTransactionLocked;
 	wHashTable* cache;
 } PCSC_SCARDCONTEXT;
 
@@ -215,6 +214,7 @@ typedef struct
 {
 	BOOL shared;
 	SCARDCONTEXT hSharedContext;
+	DWORD dwTransactionDepth;
 } PCSC_SCARDHANDLE;
 
 static HMODULE g_PCSCModule = nullptr;
@@ -1958,62 +1958,51 @@ WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardDisconnect(SCARDHANDLE hCard, 
 
 WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardBeginTransaction(SCARDHANDLE hCard)
 {
-	PCSC_LONG status = SCARD_S_SUCCESS;
-	PCSC_SCARDHANDLE* pCard = nullptr;
-	PCSC_SCARDCONTEXT* pContext = nullptr;
-
-	if (!g_PCSC.pfnSCardBeginTransaction)
-		return PCSC_SCard_LogError("g_PCSC.pfnSCardBeginTransaction");
-
-	pCard = PCSC_GetCardHandleData(hCard);
+	PCSC_SCARDHANDLE* pCard = PCSC_GetCardHandleData(hCard);
 
 	if (!pCard)
 		return SCARD_E_INVALID_HANDLE;
 
-	pContext = PCSC_GetCardContextData(pCard->hSharedContext);
-
-	if (!pContext)
-		return SCARD_E_INVALID_HANDLE;
-
-	if (pContext->isTransactionLocked)
-		return SCARD_S_SUCCESS; /* disable nested transactions */
-
-	status = g_PCSC.pfnSCardBeginTransaction(hCard);
-
-	pContext->isTransactionLocked = TRUE;
-	return PCSC_MapErrorCodeToWinSCard(status);
+	/* Track transactions per handle, but never forward them to pcsc-lite:
+	 * - pcsc-lite locks the reader per card handle. Forwarding makes operations on
+	 *   any other handle fail with SCARD_E_SHARING_VIOLATION, but a redirecting
+	 *   Windows client legitimately interleaves transactions of multiple handles.
+	 * - SCardBeginTransaction blocks (pcsc-lite retries internally) until the lock
+	 *   holder releases it. Whether called here or deferred until card I/O, that
+	 *   wait can deadlock: the call releasing the lock may be queued behind the
+	 *   blocked call, either on this context's single IRP thread or inside the
+	 *   redirecting client.
+	 * - Windows wraps most card accesses in transactions, including frequent ones
+	 *   that perform no card I/O. Holding the reader lock for their duration starves
+	 *   other applications sharing the reader.
+	 * The redirecting client serializes its own card accesses and pcsc-lite executes
+	 * each call atomically, so the lock is only ever needed to guard against other
+	 * applications using the card concurrently - and then failing a call with
+	 * SCARD_E_SHARING_VIOLATION is preferable to an unbounded wait. */
+	pCard->dwTransactionDepth++;
+	return SCARD_S_SUCCESS;
 }
 
 WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardEndTransaction(SCARDHANDLE hCard,
-                                                                 DWORD dwDisposition)
+                                                                 WINPR_ATTR_UNUSED DWORD dwDisposition)
 {
-	PCSC_LONG status = SCARD_S_SUCCESS;
-	PCSC_SCARDHANDLE* pCard = nullptr;
-	PCSC_SCARDCONTEXT* pContext = nullptr;
-	PCSC_DWORD pcsc_dwDisposition = (PCSC_DWORD)dwDisposition;
-
-	if (!g_PCSC.pfnSCardEndTransaction)
-		return PCSC_SCard_LogError("g_PCSC.pfnSCardEndTransaction");
-
-	pCard = PCSC_GetCardHandleData(hCard);
+	PCSC_SCARDHANDLE* pCard = PCSC_GetCardHandleData(hCard);
 
 	if (!pCard)
-		return SCARD_E_INVALID_HANDLE;
-
-	pContext = PCSC_GetCardContextData(pCard->hSharedContext);
-
-	if (!pContext)
 		return SCARD_E_INVALID_HANDLE;
 
 	PCSC_ReleaseCardAccess(0, hCard);
 
-	if (!pContext->isTransactionLocked)
-		return SCARD_S_SUCCESS; /* disable nested transactions */
+	if (pCard->dwTransactionDepth == 0)
+		return SCARD_S_SUCCESS; /* unbalanced SCardEndTransaction */
 
-	status = g_PCSC.pfnSCardEndTransaction(hCard, pcsc_dwDisposition);
+	pCard->dwTransactionDepth--;
 
-	pContext->isTransactionLocked = FALSE;
-	return PCSC_MapErrorCodeToWinSCard(status);
+	/* Transactions are not forwarded to pcsc-lite, see PCSC_SCardBeginTransaction.
+	 * This drops dwDisposition: a requested card reset would have to be forwarded
+	 * as SCardReconnect, but Windows resets through SCardDisconnect or
+	 * SCardReconnect, the transaction end disposition is SCARD_LEAVE_CARD. */
+	return SCARD_S_SUCCESS;
 }
 
 static LONG WINAPI PCSC_SCardCancelTransaction(SCARDHANDLE hCard)
