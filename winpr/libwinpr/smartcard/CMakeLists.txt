@@ -27,7 +27,9 @@ set(${MODULE_PREFIX}_SRCS smartcard.c smartcard.h)
 
 if(WITH_SMARTCARD_PCSC)
   winpr_definition_add(WITH_SMARTCARD_PCSC)
-  list(APPEND ${MODULE_PREFIX}_SRCS smartcard_pcsc.c smartcard_pcsc.h)
+  list(APPEND ${MODULE_PREFIX}_SRCS smartcard_pcsc.c smartcard_pcsc.h smartcard_pcsc_transaction.c
+       smartcard_pcsc_transaction.h
+  )
 endif()
 
 if(WITH_SMARTCARD_INSPECT)
