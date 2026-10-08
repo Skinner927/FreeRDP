@@ -28,24 +28,34 @@
 /**
  * WinSCard transactions emulated on top of pcsc-lite's reader lock.
  *
- * pcsc-lite locks a reader for one card handle: card I/O on any other handle
- * fails with SCARD_E_SHARING_VIOLATION and SCardBeginTransaction blocks (the
- * client library retries forever) until the holder calls SCardEndTransaction.
- * A redirecting Windows client legitimately interleaves transactions of several
- * handles on one reader, and its calls arrive serialized, so forwarding
- * transactions one to one deadlocks as soon as two handles compete.
+ * A redirected Windows client runs transactions from many contexts at once
+ * and relies on SCardBeginTransaction blocking until the reader is free, but
+ * forwarding it to pcsc-lite does not work: pcsc-lite locks the reader for one
+ * card handle, its client library retries SCardBeginTransaction forever on
+ * SCARD_E_SHARING_VIOLATION, and all calls of one context are processed by a
+ * single thread, so a blocked SCardBeginTransaction can sit in front of the
+ * SCardEndTransaction that would release the lock.
  *
- * Instead, SCardBeginTransaction only records a transaction per handle. The
- * pcsc-lite lock is taken lazily by the first card I/O inside the transaction
- * and handed over between our own handles instead of waiting for them. Only a
- * foreign application holding the reader lock makes us wait, bounded by
- * PCSC_TRANSACTION_WAIT_MS.
+ * So the transaction itself is emulated here, per reader:
+ * - SCardBeginTransaction takes a virtual lock shared by all of our handles.
+ *   If another handle holds it, we wait while that handle is active. A
+ *   holder idle for PCSC_TRANSACTION_IDLE_MS (Windows drops such transactions
+ *   too) loses the transaction and waits again on its next card access.
+ *   The smartcard channel runs SCardBeginTransaction off its per context
+ *   thread, so waiting here never blocks the holder's calls.
+ * - pcsc-lite's reader lock is only taken by the first card I/O inside the
+ *   transaction and released by SCardEndTransaction. Other applications see
+ *   the reader locked only while the client actually accesses the card.
+ * - Only a foreign application holding the reader lock makes card I/O wait,
+ *   bounded by PCSC_TRANSACTION_WAIT_MS.
  */
 
 /** How long card I/O inside a transaction waits for another application to
- *  release the reader lock before failing with SCARD_E_SHARING_VIOLATION.
- *  Windows itself drops transactions idle for five seconds. */
+ *  release the reader lock before failing with SCARD_E_SHARING_VIOLATION. */
 #define PCSC_TRANSACTION_WAIT_MS 5000
+/** A transaction of one of our handles without card access for this long is
+ *  taken over by a waiting handle. Windows uses the same five seconds. */
+#define PCSC_TRANSACTION_IDLE_MS 5000
 /** Poll interval while waiting, matches pcsc-lite's PCSCLITE_LOCK_POLL_RATE. */
 #define PCSC_TRANSACTION_POLL_MS 100
 
@@ -57,8 +67,10 @@ typedef struct
 	/** pcsc-lite SCardEndTransaction */
 	PCSC_LONG (*end)(void* context, SCARDHANDLE hCard, PCSC_DWORD dwDisposition);
 	/** Non-blocking check whether another handle holds the reader lock:
-	 *  returns SCARD_E_SHARING_VIOLATION if so (pcsc-lite SCardStatus) */
+	 *  returns SCARD_E_SHARING_VIOLATION if so (pcsc-lite SCardStatus with
+	 *  PCSCLITE_NO_BLOCKING set) */
 	PCSC_LONG (*probe)(void* context, SCARDHANDLE hCard);
+	/** Called without any lock held */
 	void (*sleep)(void* context, UINT32 ms);
 	/** Monotonic milliseconds */
 	UINT64 (*tick)(void* context);
@@ -81,19 +93,19 @@ PCSC_TRANSACTION_TABLE* PCSC_TransactionTableNew(const PCSC_TRANSACTION_OPS* ops
 /** Associate a card handle with the pcsc-lite reader name it is connected to */
 BOOL PCSC_TransactionHandleInit(PCSC_TRANSACTION_HANDLE* handle, SCARDHANDLE hCard,
                                 const char* szReader);
-/** Drop any reader lock ownership of the handle (pcsc-lite releases the lock
+/** Drop any transaction of the handle (pcsc-lite releases the reader lock
  *  itself on SCardDisconnect) and free its resources */
 void PCSC_TransactionHandleUninit(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle);
 
-/** SCardBeginTransaction: never touches pcsc-lite */
+/** SCardBeginTransaction: waits for another of our handles, never calls pcsc-lite */
 PCSC_LONG PCSC_TransactionBegin(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle);
 /** SCardEndTransaction: releases the reader lock if held, forwards dwDisposition */
 PCSC_LONG PCSC_TransactionEnd(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle,
                               PCSC_DWORD dwDisposition);
-/** Call before card I/O: inside a transaction, takes the reader lock for the
- *  handle (taking it away from another of our handles if necessary). Returns
- *  SCARD_E_SHARING_VIOLATION if a foreign application keeps the lock for
- *  longer than PCSC_TRANSACTION_WAIT_MS. */
+/** Call before card I/O: inside a transaction, makes sure the handle holds
+ *  the transaction and the reader lock. Returns SCARD_E_SHARING_VIOLATION if
+ *  a foreign application keeps the lock for longer than
+ *  PCSC_TRANSACTION_WAIT_MS. */
 PCSC_LONG PCSC_TransactionAcquire(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle);
 
 #endif /* WINPR_SMARTCARD_PCSC_TRANSACTION_PRIVATE_H */

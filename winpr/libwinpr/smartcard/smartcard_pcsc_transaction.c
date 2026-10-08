@@ -25,12 +25,34 @@
 
 #include "smartcard_pcsc_transaction.h"
 
+#include "../log.h"
+#define TAG WINPR_TAG("smartcard")
+
+/* pcsc-lite defines its error codes as ((LONG)0x8010xxxx). With a 64 bit LONG
+ * they come back as large positive numbers and never compare equal to
+ * WinSCard's negative 32 bit constants, so fold every result first. */
+static PCSC_LONG pcsc_status(PCSC_LONG status)
+{
+	return (PCSC_LONG)(INT32)(UINT32)status;
+}
+
+/* Transaction state of one pcsc-lite reader */
+typedef struct
+{
+	/* our handle currently inside the (emulated) transaction */
+	PCSC_TRANSACTION_HANDLE* owner;
+	/* owner holds pcsc-lite's reader lock */
+	BOOL readerLocked;
+	/* tick of the owner's last SCardBeginTransaction or card access */
+	UINT64 lastActivity;
+} pcsc_reader_transaction;
+
 struct pcsc_transaction_table
 {
 	PCSC_TRANSACTION_OPS ops;
 	CRITICAL_SECTION lock;
-	/* pcsc-lite reader name -> PCSC_TRANSACTION_HANDLE* holding the reader lock */
-	wHashTable* owners;
+	/* pcsc-lite reader name -> pcsc_reader_transaction* */
+	wHashTable* readers;
 };
 
 void PCSC_TransactionTableFree(PCSC_TRANSACTION_TABLE* table)
@@ -38,7 +60,7 @@ void PCSC_TransactionTableFree(PCSC_TRANSACTION_TABLE* table)
 	if (!table)
 		return;
 
-	HashTable_Free(table->owners);
+	HashTable_Free(table->readers);
 	DeleteCriticalSection(&table->lock);
 	free(table);
 }
@@ -53,14 +75,22 @@ PCSC_TRANSACTION_TABLE* PCSC_TransactionTableNew(const PCSC_TRANSACTION_OPS* ops
 
 	table->ops = *ops;
 	InitializeCriticalSection(&table->lock);
-	table->owners = HashTable_New(FALSE);
-	if (!table->owners || !HashTable_SetupForStringData(table->owners, FALSE))
+	table->readers = HashTable_New(FALSE);
+	if (!table->readers || !HashTable_SetupForStringData(table->readers, FALSE))
+		goto fail;
+
 	{
-		PCSC_TransactionTableFree(table);
-		return nullptr;
+		wObject* obj = HashTable_ValueObject(table->readers);
+		if (!obj)
+			goto fail;
+		obj->fnObjectFree = free;
 	}
 
 	return table;
+
+fail:
+	PCSC_TransactionTableFree(table);
+	return nullptr;
 }
 
 BOOL PCSC_TransactionHandleInit(PCSC_TRANSACTION_HANDLE* handle, SCARDHANDLE hCard,
@@ -77,6 +107,77 @@ BOOL PCSC_TransactionHandleInit(PCSC_TRANSACTION_HANDLE* handle, SCARDHANDLE hCa
 	return handle->szReader != nullptr;
 }
 
+/* Must be called with the table lock held */
+static pcsc_reader_transaction* reader_transaction(PCSC_TRANSACTION_TABLE* table,
+                                                   const char* szReader, BOOL create)
+{
+	pcsc_reader_transaction* reader = HashTable_GetItemValue(table->readers, szReader);
+	if (reader || !create)
+		return reader;
+
+	reader = calloc(1, sizeof(pcsc_reader_transaction));
+	if (!reader)
+		return nullptr;
+
+	if (!HashTable_Insert(table->readers, szReader, reader))
+	{
+		free(reader);
+		return nullptr;
+	}
+	return reader;
+}
+
+/* Must be called with the table lock held. Gives up the reader lock pcsc-lite
+ * holds for the current owner so that another handle can take it. */
+static void release_reader_lock(PCSC_TRANSACTION_TABLE* table, pcsc_reader_transaction* reader,
+                                PCSC_DWORD dwDisposition, PCSC_LONG* pStatus)
+{
+	WINPR_ASSERT(reader->owner);
+
+	const PCSC_LONG status =
+	    pcsc_status(table->ops.end(table->ops.context, reader->owner->hCard, dwDisposition));
+	if (status != SCARD_S_SUCCESS)
+		WLog_WARN(TAG, "[%s] hCard=%p SCardEndTransaction(disposition=%" PRIu32 ") failed: %s",
+		          reader->owner->szReader, (void*)reader->owner->hCard, (UINT32)dwDisposition,
+		          SCardGetErrorString((LONG)status));
+	reader->readerLocked = FALSE;
+	if (pStatus)
+		*pStatus = status;
+}
+
+/* Must be called with the table lock held. Returns TRUE once handle is inside
+ * the reader's transaction, FALSE if it has to wait for the current owner. */
+static BOOL claim_transaction(PCSC_TRANSACTION_TABLE* table, pcsc_reader_transaction* reader,
+                              PCSC_TRANSACTION_HANDLE* handle, UINT64 now, const char* what)
+{
+	PCSC_TRANSACTION_HANDLE* owner = reader->owner;
+
+	if (owner == handle)
+	{
+		reader->lastActivity = now;
+		return TRUE;
+	}
+
+	if (owner)
+	{
+		/* Wait while the owner uses the card. A handle that stopped accessing
+		 * the card is treated like Windows treats it: its transaction is over. */
+		if ((now - reader->lastActivity) < PCSC_TRANSACTION_IDLE_MS)
+			return FALSE;
+
+		if (reader->readerLocked)
+			release_reader_lock(table, reader, SCARD_LEAVE_CARD, nullptr);
+
+		WLog_DBG(TAG, "[%s] hCard=%p %s: takes transaction over from idle hCard=%p",
+		         handle->szReader, (void*)handle->hCard, what, (void*)owner->hCard);
+	}
+
+	reader->owner = handle;
+	reader->readerLocked = FALSE;
+	reader->lastActivity = now;
+	return TRUE;
+}
+
 void PCSC_TransactionHandleUninit(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle)
 {
 	WINPR_ASSERT(table);
@@ -84,8 +185,13 @@ void PCSC_TransactionHandleUninit(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTIO
 		return;
 
 	EnterCriticalSection(&table->lock);
-	if (HashTable_GetItemValue(table->owners, handle->szReader) == handle)
-		HashTable_Remove(table->owners, handle->szReader);
+	pcsc_reader_transaction* reader = reader_transaction(table, handle->szReader, FALSE);
+	if (reader && reader->owner == handle)
+	{
+		/* pcsc-lite releases the reader lock itself when the handle goes away */
+		reader->owner = nullptr;
+		reader->readerLocked = FALSE;
+	}
 	LeaveCriticalSection(&table->lock);
 
 	free(handle->szReader);
@@ -98,10 +204,39 @@ PCSC_LONG PCSC_TransactionBegin(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_
 	WINPR_ASSERT(table);
 	WINPR_ASSERT(handle);
 
-	EnterCriticalSection(&table->lock);
-	handle->dwDepth++;
-	LeaveCriticalSection(&table->lock);
-	return SCARD_S_SUCCESS;
+	for (;;)
+	{
+		EnterCriticalSection(&table->lock);
+
+		if (handle->dwDepth > 0)
+		{
+			handle->dwDepth++;
+			WLog_DBG(TAG, "[%s] hCard=%p begin nested transaction, depth=%" PRIu32,
+			         handle->szReader, (void*)handle->hCard, handle->dwDepth);
+			LeaveCriticalSection(&table->lock);
+			return SCARD_S_SUCCESS;
+		}
+
+		pcsc_reader_transaction* reader = reader_transaction(table, handle->szReader, TRUE);
+		if (!reader)
+		{
+			LeaveCriticalSection(&table->lock);
+			return SCARD_E_NO_MEMORY;
+		}
+
+		const UINT64 now = table->ops.tick(table->ops.context);
+		if (claim_transaction(table, reader, handle, now, "begin"))
+		{
+			handle->dwDepth = 1;
+			WLog_DBG(TAG, "[%s] hCard=%p begin transaction", handle->szReader,
+			         (void*)handle->hCard);
+			LeaveCriticalSection(&table->lock);
+			return SCARD_S_SUCCESS;
+		}
+
+		LeaveCriticalSection(&table->lock);
+		table->ops.sleep(table->ops.context, PCSC_TRANSACTION_POLL_MS);
+	}
 }
 
 PCSC_LONG PCSC_TransactionEnd(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle,
@@ -115,32 +250,45 @@ PCSC_LONG PCSC_TransactionEnd(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HA
 
 	if (handle->dwDepth == 0)
 	{
+		WLog_WARN(TAG, "[%s] hCard=%p end transaction without begin", handle->szReader,
+		          (void*)handle->hCard);
 		status = SCARD_E_NOT_TRANSACTED;
 		goto out;
 	}
 
 	handle->dwDepth--;
 	if (handle->dwDepth > 0)
-		goto out;
-
-	PCSC_TRANSACTION_HANDLE* owner = HashTable_GetItemValue(table->owners, handle->szReader);
-	if (owner == handle)
 	{
-		status = table->ops.end(table->ops.context, handle->hCard, dwDisposition);
-		HashTable_Remove(table->owners, handle->szReader);
+		WLog_DBG(TAG, "[%s] hCard=%p end nested transaction, depth=%" PRIu32, handle->szReader,
+		         (void*)handle->hCard, handle->dwDepth);
+		goto out;
+	}
+
+	pcsc_reader_transaction* reader = reader_transaction(table, handle->szReader, FALSE);
+	if (reader && reader->owner == handle)
+	{
+		/* pcsc-lite performs the card action even for an unlocked reader */
+		if (reader->readerLocked || dwDisposition != SCARD_LEAVE_CARD)
+			release_reader_lock(table, reader, dwDisposition, &status);
+		reader->owner = nullptr;
+		WLog_DBG(TAG, "[%s] hCard=%p end transaction, disposition=%" PRIu32 " -> %s",
+		         handle->szReader, (void*)handle->hCard, (UINT32)dwDisposition,
+		         SCardGetErrorString((LONG)status));
 	}
 	else if (dwDisposition != SCARD_LEAVE_CARD)
 	{
-		/* The card action is still due even though this handle never took the
-		 * lock. pcscd performs it for an unlocked reader, so give up a lock held
-		 * by another of our handles first; a foreign holder makes pcscd answer
-		 * SCARD_E_SHARING_VIOLATION, which is the honest result. */
-		if (owner)
-		{
-			table->ops.end(table->ops.context, owner->hCard, SCARD_LEAVE_CARD);
-			HashTable_Remove(table->owners, handle->szReader);
-		}
-		status = table->ops.end(table->ops.context, handle->hCard, dwDisposition);
+		/* The transaction was taken over, but the card action is still due.
+		 * pcscd refuses it with SCARD_E_SHARING_VIOLATION while the new owner
+		 * holds the reader lock, which is the honest answer. */
+		status = pcsc_status(table->ops.end(table->ops.context, handle->hCard, dwDisposition));
+		WLog_DBG(TAG, "[%s] hCard=%p end taken over transaction, disposition=%" PRIu32 " -> %s",
+		         handle->szReader, (void*)handle->hCard, (UINT32)dwDisposition,
+		         SCardGetErrorString((LONG)status));
+	}
+	else
+	{
+		WLog_DBG(TAG, "[%s] hCard=%p end taken over transaction", handle->szReader,
+		         (void*)handle->hCard);
 	}
 
 out:
@@ -156,54 +304,71 @@ PCSC_LONG PCSC_TransactionAcquire(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTIO
 	if (handle->dwDepth == 0)
 		return SCARD_S_SUCCESS; /* plain shared access, nothing to lock */
 
-	const UINT64 start = table->ops.tick(table->ops.context);
+	BOOL foreignWait = FALSE;
+	UINT64 foreignSince = 0;
 
 	for (;;)
 	{
 		PCSC_LONG status = SCARD_S_SUCCESS;
 		EnterCriticalSection(&table->lock);
 
-		PCSC_TRANSACTION_HANDLE* owner = HashTable_GetItemValue(table->owners, handle->szReader);
-		if (owner == handle)
-			goto out; /* already holding the reader lock */
-
-		if (owner)
+		pcsc_reader_transaction* reader = reader_transaction(table, handle->szReader, TRUE);
+		if (!reader)
 		{
-			/* Another of our handles holds the reader lock. Its transaction stays
-			 * open for us, but pcsc-lite's lock moves to the handle doing I/O now:
-			 * waiting for the owner could deadlock, its SCardEndTransaction may be
-			 * queued behind this very call. */
-			table->ops.end(table->ops.context, owner->hCard, SCARD_LEAVE_CARD);
-			HashTable_Remove(table->owners, handle->szReader);
+			LeaveCriticalSection(&table->lock);
+			return SCARD_E_NO_MEMORY;
+		}
+
+		const UINT64 now = table->ops.tick(table->ops.context);
+		if (!claim_transaction(table, reader, handle, now, "card access"))
+		{
+			/* another context holds the transaction and is using the card */
+			LeaveCriticalSection(&table->lock);
+			table->ops.sleep(table->ops.context, PCSC_TRANSACTION_POLL_MS);
+			continue;
+		}
+
+		if (reader->readerLocked)
+		{
+			LeaveCriticalSection(&table->lock);
+			return SCARD_S_SUCCESS;
 		}
 
 		/* pcsc-lite's SCardBeginTransaction blocks until the lock is free, so
 		 * only call it once a non-blocking probe says a foreign application does
 		 * not hold the lock. The probe also reports a reset or removed card. */
-		status = table->ops.probe(table->ops.context, handle->hCard);
+		status = pcsc_status(table->ops.probe(table->ops.context, handle->hCard));
 		if (status == SCARD_S_SUCCESS)
 		{
-			status = table->ops.begin(table->ops.context, handle->hCard);
+			status = pcsc_status(table->ops.begin(table->ops.context, handle->hCard));
 			if (status == SCARD_S_SUCCESS)
-			{
-				if (!HashTable_Insert(table->owners, handle->szReader, handle))
-					status = SCARD_E_NO_MEMORY;
-			}
+				reader->readerLocked = TRUE;
+			WLog_DBG(TAG, "[%s] hCard=%p reader lock -> %s%s", handle->szReader,
+			         (void*)handle->hCard, SCardGetErrorString((LONG)status),
+			         foreignWait ? " (after waiting for another application)" : "");
 		}
 
-		if (status != SCARD_E_SHARING_VIOLATION)
-			goto out;
-
 		LeaveCriticalSection(&table->lock);
 
-		if (table->ops.tick(table->ops.context) - start >= PCSC_TRANSACTION_WAIT_MS)
+		if (status != SCARD_E_SHARING_VIOLATION)
+			return status;
+
+		if (!foreignWait)
+		{
+			foreignWait = TRUE;
+			foreignSince = now;
+			WLog_DBG(TAG, "[%s] hCard=%p reader locked by another application, waiting",
+			         handle->szReader, (void*)handle->hCard);
+		}
+		else if (now - foreignSince >= PCSC_TRANSACTION_WAIT_MS)
+		{
+			WLog_WARN(TAG,
+			          "[%s] hCard=%p reader locked by another application for %" PRIu32
+			          " ms, giving up",
+			          handle->szReader, (void*)handle->hCard, (UINT32)PCSC_TRANSACTION_WAIT_MS);
 			return SCARD_E_SHARING_VIOLATION;
+		}
 
 		table->ops.sleep(table->ops.context, PCSC_TRANSACTION_POLL_MS);
-		continue;
-
-	out:
-		LeaveCriticalSection(&table->lock);
-		return status;
 	}
 }

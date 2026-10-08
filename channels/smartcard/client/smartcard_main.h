@@ -54,6 +54,12 @@ typedef struct
 	SCARDCONTEXT hContext;
 	wMessageQueue* IrpQueue;
 	SMARTCARD_DEVICE* smartcard;
+
+	/* SCardBeginTransaction IRPs run on threads of their own, see
+	 * smartcard_context_thread. Counted so the context outlives them. */
+	CRITICAL_SECTION beginTransactionLock;
+	UINT32 beginTransactionsPending;
+	HANDLE beginTransactionsDone;
 } SMARTCARD_CONTEXT;
 
 #endif /* FREERDP_CHANNEL_SMARTCARD_CLIENT_MAIN_H */

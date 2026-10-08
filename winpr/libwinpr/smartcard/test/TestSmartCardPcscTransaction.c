@@ -4,6 +4,8 @@
  * Simulates pcsc-lite's per reader lock: a fake card handle encodes its reader
  * in the upper bits (hCard >> 8), the fake daemon tracks one lock owner per
  * reader and the fake clock advances only when the code under test sleeps.
+ * Sleeping may also run one scheduled SCardEndTransaction, standing in for
+ * another context thread ending its transaction while we wait.
  */
 
 #include <stdio.h>
@@ -34,6 +36,26 @@ typedef struct
 	PCSC_DWORD lastEndDisposition;
 } fake_pcsc;
 
+typedef struct
+{
+	fake_pcsc fake;
+	PCSC_TRANSACTION_OPS ops;
+	PCSC_TRANSACTION_TABLE* table;
+
+	/* another context ends this handle's transaction at this time */
+	PCSC_TRANSACTION_HANDLE* endHandle;
+	UINT64 endAt;
+	PCSC_LONG endStatus;
+} fixture;
+
+/* pcsc-lite hands out its error codes as ((LONG)0x8010xxxx) with a 64 bit
+ * LONG on most platforms, so they arrive as large positive numbers, unlike
+ * WinSCard's negative 32 bit values. */
+static PCSC_LONG raw(LONG winscardCode)
+{
+	return (PCSC_LONG)(UINT32)winscardCode;
+}
+
 static void fake_release_foreign(fake_pcsc* fake, size_t reader)
 {
 	if (fake->foreignReleaseAt && fake->now >= fake->foreignReleaseAt &&
@@ -43,69 +65,66 @@ static void fake_release_foreign(fake_pcsc* fake, size_t reader)
 
 static PCSC_LONG fake_begin(void* context, SCARDHANDLE hCard)
 {
-	fake_pcsc* fake = context;
+	fake_pcsc* fake = &((fixture*)context)->fake;
 	const size_t reader = FAKE_READER(hCard);
 	fake->beginCalls++;
 	fake->lastBegin = hCard;
 	fake_release_foreign(fake, reader);
 	if (fake->lockOwner[reader] != 0 && fake->lockOwner[reader] != hCard)
-		return SCARD_E_SHARING_VIOLATION;
+		return raw(SCARD_E_SHARING_VIOLATION);
 	fake->lockOwner[reader] = hCard;
 	return SCARD_S_SUCCESS;
 }
 
 static PCSC_LONG fake_end(void* context, SCARDHANDLE hCard, PCSC_DWORD dwDisposition)
 {
-	fake_pcsc* fake = context;
+	fake_pcsc* fake = &((fixture*)context)->fake;
 	const size_t reader = FAKE_READER(hCard);
 	fake->endCalls++;
 	fake->lastEnd = hCard;
 	fake->lastEndDisposition = dwDisposition;
 	fake_release_foreign(fake, reader);
-	/* pcscd: "No card reset within a transaction" of someone else */
-	if (dwDisposition != SCARD_LEAVE_CARD && fake->lockOwner[reader] != 0 &&
-	    fake->lockOwner[reader] != hCard)
-		return SCARD_E_SHARING_VIOLATION;
-	if (fake->lockOwner[reader] == hCard)
-		fake->lockOwner[reader] = 0;
+	/* pcscd: a handle that does not hold the lock may not end a transaction
+	 * nor reset the card while someone else holds it */
+	if (fake->lockOwner[reader] != 0 && fake->lockOwner[reader] != hCard)
+		return raw(SCARD_E_SHARING_VIOLATION);
+	fake->lockOwner[reader] = 0;
 	return SCARD_S_SUCCESS;
 }
 
 static PCSC_LONG fake_probe(void* context, SCARDHANDLE hCard)
 {
-	fake_pcsc* fake = context;
+	fake_pcsc* fake = &((fixture*)context)->fake;
 	const size_t reader = FAKE_READER(hCard);
 	fake->probeCalls++;
 	fake_release_foreign(fake, reader);
 	if (fake->lockOwner[reader] != 0 && fake->lockOwner[reader] != hCard)
-		return SCARD_E_SHARING_VIOLATION;
+		return raw(SCARD_E_SHARING_VIOLATION);
 	return SCARD_S_SUCCESS;
 }
 
 static void fake_sleep(void* context, UINT32 ms)
 {
-	fake_pcsc* fake = context;
-	fake->sleepCalls++;
-	fake->now += ms;
+	fixture* f = context;
+	f->fake.sleepCalls++;
+	f->fake.now += ms;
+	if (f->endHandle && f->fake.now >= f->endAt)
+	{
+		PCSC_TRANSACTION_HANDLE* handle = f->endHandle;
+		f->endHandle = nullptr;
+		f->endStatus = PCSC_TransactionEnd(f->table, handle, SCARD_LEAVE_CARD);
+	}
 }
 
 static UINT64 fake_tick(void* context)
 {
-	fake_pcsc* fake = context;
-	return fake->now;
+	return ((fixture*)context)->fake.now;
 }
-
-typedef struct
-{
-	fake_pcsc fake;
-	PCSC_TRANSACTION_OPS ops;
-	PCSC_TRANSACTION_TABLE* table;
-} fixture;
 
 static BOOL fixture_init(fixture* f)
 {
 	memset(f, 0, sizeof(*f));
-	f->ops.context = &f->fake;
+	f->ops.context = f;
 	f->ops.begin = fake_begin;
 	f->ops.end = fake_end;
 	f->ops.probe = fake_probe;
@@ -118,6 +137,13 @@ static BOOL fixture_init(fixture* f)
 static void fixture_uninit(fixture* f)
 {
 	PCSC_TransactionTableFree(f->table);
+}
+
+static void fixture_end_later(fixture* f, PCSC_TRANSACTION_HANDLE* handle, UINT64 at)
+{
+	f->endHandle = handle;
+	f->endAt = at;
+	f->endStatus = SCARD_F_INTERNAL_ERROR;
 }
 
 #define CHECK(cond)                                                                        \
@@ -235,7 +261,7 @@ static BOOL test_unbalanced_end_is_rejected(void)
 	return TRUE;
 }
 
-static BOOL test_our_handles_hand_over_lock_without_waiting(void)
+static BOOL test_begin_waits_for_holder_in_other_context(void)
 {
 	fixture f;
 	PCSC_TRANSACTION_HANDLE a;
@@ -244,36 +270,105 @@ static BOOL test_our_handles_hand_over_lock_without_waiting(void)
 	CHECK(PCSC_TransactionHandleInit(&a, 0x101, "Reader 1"));
 	CHECK(PCSC_TransactionHandleInit(&b, 0x102, "Reader 1"));
 
-	/* both handles are inside a transaction, A does I/O first */
 	CHECK(PCSC_TransactionBegin(f.table, &a) == SCARD_S_SUCCESS);
-	CHECK(PCSC_TransactionBegin(f.table, &b) == SCARD_S_SUCCESS);
 	CHECK(PCSC_TransactionAcquire(f.table, &a) == SCARD_S_SUCCESS);
 	CHECK(f.fake.lockOwner[1] == 0x101);
 
-	/* B's I/O takes the lock away from A: pcsc-lite End(A), Begin(B) */
+	/* B's Begin blocks on its own context thread until A ends after 300ms */
+	fixture_end_later(&f, &a, 300);
+	CHECK(PCSC_TransactionBegin(f.table, &b) == SCARD_S_SUCCESS);
+	CHECK(f.endHandle == nullptr);
+	CHECK(f.endStatus == SCARD_S_SUCCESS);
+	CHECK(f.fake.sleepCalls == 3);
+	CHECK(f.fake.now == 300);
+	/* A released the reader lock itself, nothing was taken away from it */
+	CHECK(f.fake.endCalls == 1);
+	CHECK(f.fake.lastEnd == 0x101);
+	CHECK(f.fake.lockOwner[1] == 0);
+	CHECK(f.fake.beginCalls == 1);
+
 	CHECK(PCSC_TransactionAcquire(f.table, &b) == SCARD_S_SUCCESS);
 	CHECK(f.fake.lockOwner[1] == 0x102);
+	CHECK(f.fake.beginCalls == 2);
+	CHECK(PCSC_TransactionEnd(f.table, &b, SCARD_LEAVE_CARD) == SCARD_S_SUCCESS);
+	CHECK(f.fake.lockOwner[1] == 0);
+
+	PCSC_TransactionHandleUninit(f.table, &a);
+	PCSC_TransactionHandleUninit(f.table, &b);
+	fixture_uninit(&f);
+	return TRUE;
+}
+
+static BOOL test_idle_holder_in_other_context_is_taken_over(void)
+{
+	fixture f;
+	PCSC_TRANSACTION_HANDLE a;
+	PCSC_TRANSACTION_HANDLE b;
+	CHECK(fixture_init(&f));
+	CHECK(PCSC_TransactionHandleInit(&a, 0x101, "Reader 1"));
+	CHECK(PCSC_TransactionHandleInit(&b, 0x102, "Reader 1"));
+
+	CHECK(PCSC_TransactionBegin(f.table, &a) == SCARD_S_SUCCESS);
+	CHECK(PCSC_TransactionAcquire(f.table, &a) == SCARD_S_SUCCESS);
+
+	/* A never ends: after PCSC_TRANSACTION_IDLE_MS without card access B takes over */
+	CHECK(PCSC_TransactionBegin(f.table, &b) == SCARD_S_SUCCESS);
+	CHECK(f.fake.now == PCSC_TRANSACTION_IDLE_MS);
+	CHECK(f.fake.sleepCalls == PCSC_TRANSACTION_IDLE_MS / PCSC_TRANSACTION_POLL_MS);
 	CHECK(f.fake.endCalls == 1);
 	CHECK(f.fake.lastEnd == 0x101);
 	CHECK(f.fake.lastEndDisposition == SCARD_LEAVE_CARD);
-	CHECK(f.fake.beginCalls == 2);
-	CHECK(f.fake.sleepCalls == 0);
+	CHECK(f.fake.lockOwner[1] == 0);
 
-	/* A's next I/O takes it back, still without waiting */
+	CHECK(PCSC_TransactionAcquire(f.table, &b) == SCARD_S_SUCCESS);
+	CHECK(f.fake.lockOwner[1] == 0x102);
+	CHECK(f.fake.beginCalls == 2);
+
+	/* A's transaction is still open; its next I/O waits for B, which is active */
+	fixture_end_later(&f, &b, f.fake.now + 300);
 	CHECK(PCSC_TransactionAcquire(f.table, &a) == SCARD_S_SUCCESS);
-	CHECK(f.fake.lockOwner[1] == 0x101);
+	CHECK(f.endHandle == nullptr);
+	CHECK(f.endStatus == SCARD_S_SUCCESS);
 	CHECK(f.fake.endCalls == 2);
 	CHECK(f.fake.lastEnd == 0x102);
-	CHECK(f.fake.beginCalls == 3);
-	CHECK(f.fake.sleepCalls == 0);
-
-	/* B ends its transaction while A holds the lock: nothing to release */
-	CHECK(PCSC_TransactionEnd(f.table, &b, SCARD_LEAVE_CARD) == SCARD_S_SUCCESS);
-	CHECK(f.fake.endCalls == 2);
 	CHECK(f.fake.lockOwner[1] == 0x101);
+	CHECK(f.fake.beginCalls == 3);
 
 	CHECK(PCSC_TransactionEnd(f.table, &a, SCARD_LEAVE_CARD) == SCARD_S_SUCCESS);
 	CHECK(f.fake.endCalls == 3);
+	CHECK(f.fake.lockOwner[1] == 0);
+
+	PCSC_TransactionHandleUninit(f.table, &a);
+	PCSC_TransactionHandleUninit(f.table, &b);
+	fixture_uninit(&f);
+	return TRUE;
+}
+
+static BOOL test_begin_waits_for_holder_in_same_context(void)
+{
+	fixture f;
+	PCSC_TRANSACTION_HANDLE a;
+	PCSC_TRANSACTION_HANDLE b;
+	CHECK(fixture_init(&f));
+	CHECK(PCSC_TransactionHandleInit(&a, 0x101, "Reader 1"));
+	CHECK(PCSC_TransactionHandleInit(&b, 0x102, "Reader 1"));
+
+	/* Two handles of one context: the channel runs SCardBeginTransaction on a
+	 * worker thread, so A's calls keep flowing while B waits for A to end.
+	 * The emulation itself does not care which context a handle belongs to. */
+	CHECK(PCSC_TransactionBegin(f.table, &a) == SCARD_S_SUCCESS);
+	CHECK(PCSC_TransactionAcquire(f.table, &a) == SCARD_S_SUCCESS);
+	fixture_end_later(&f, &a, 200);
+	CHECK(PCSC_TransactionBegin(f.table, &b) == SCARD_S_SUCCESS);
+	CHECK(f.endHandle == nullptr);
+	CHECK(f.fake.sleepCalls == 2);
+	CHECK(f.fake.endCalls == 1);
+	CHECK(f.fake.lastEnd == 0x101);
+	CHECK(f.fake.lockOwner[1] == 0);
+
+	CHECK(PCSC_TransactionAcquire(f.table, &b) == SCARD_S_SUCCESS);
+	CHECK(f.fake.lockOwner[1] == 0x102);
+	CHECK(PCSC_TransactionEnd(f.table, &b, SCARD_LEAVE_CARD) == SCARD_S_SUCCESS);
 	CHECK(f.fake.lockOwner[1] == 0);
 
 	PCSC_TransactionHandleUninit(f.table, &a);
@@ -293,6 +388,7 @@ static BOOL test_different_readers_lock_independently(void)
 
 	CHECK(PCSC_TransactionBegin(f.table, &a) == SCARD_S_SUCCESS);
 	CHECK(PCSC_TransactionBegin(f.table, &b) == SCARD_S_SUCCESS);
+	CHECK(f.fake.sleepCalls == 0);
 	CHECK(PCSC_TransactionAcquire(f.table, &a) == SCARD_S_SUCCESS);
 	CHECK(PCSC_TransactionAcquire(f.table, &b) == SCARD_S_SUCCESS);
 
@@ -378,29 +474,32 @@ static BOOL test_end_with_reset_forwards_even_without_lock(void)
 	CHECK(PCSC_TransactionHandleInit(&a, 0x101, "Reader 1"));
 	CHECK(PCSC_TransactionHandleInit(&b, 0x102, "Reader 1"));
 
-	/* A never did any I/O, so it holds no lock, but asks for a reset */
+	/* A never did any I/O, so it holds no reader lock, but asks for a reset */
 	CHECK(PCSC_TransactionBegin(f.table, &a) == SCARD_S_SUCCESS);
 	CHECK(PCSC_TransactionEnd(f.table, &a, SCARD_RESET_CARD) == SCARD_S_SUCCESS);
 	CHECK(f.fake.endCalls == 1);
 	CHECK(f.fake.lastEnd == 0x101);
 	CHECK(f.fake.lastEndDisposition == SCARD_RESET_CARD);
 
-	/* B holds the lock when A asks for a reset: B's lock is given up first,
-	 * pcscd refuses a reset while another handle holds the lock */
-	CHECK(PCSC_TransactionBegin(f.table, &b) == SCARD_S_SUCCESS);
-	CHECK(PCSC_TransactionAcquire(f.table, &b) == SCARD_S_SUCCESS);
+	/* A lost its transaction to B (idle for too long) and asks for a reset
+	 * while B holds the reader lock: pcscd refuses, which is passed on */
 	CHECK(PCSC_TransactionBegin(f.table, &a) == SCARD_S_SUCCESS);
-	CHECK(PCSC_TransactionEnd(f.table, &a, SCARD_UNPOWER_CARD) == SCARD_S_SUCCESS);
-	CHECK(f.fake.endCalls == 3);
-	CHECK(f.fake.lastEnd == 0x101);
-	CHECK(f.fake.lastEndDisposition == SCARD_UNPOWER_CARD);
+	CHECK(PCSC_TransactionAcquire(f.table, &a) == SCARD_S_SUCCESS);
+	CHECK(PCSC_TransactionBegin(f.table, &b) == SCARD_S_SUCCESS);
+	CHECK(f.fake.now == PCSC_TRANSACTION_IDLE_MS);
 	CHECK(f.fake.lockOwner[1] == 0);
-
-	/* B's transaction is still open, its next I/O takes the lock again */
 	CHECK(PCSC_TransactionAcquire(f.table, &b) == SCARD_S_SUCCESS);
 	CHECK(f.fake.lockOwner[1] == 0x102);
+	CHECK(PCSC_TransactionEnd(f.table, &a, SCARD_UNPOWER_CARD) == SCARD_E_SHARING_VIOLATION);
+	CHECK(f.fake.lockOwner[1] == 0x102);
+
+	/* once B is done, A's reset request goes through without a lock */
 	CHECK(PCSC_TransactionEnd(f.table, &b, SCARD_LEAVE_CARD) == SCARD_S_SUCCESS);
 	CHECK(f.fake.lockOwner[1] == 0);
+	CHECK(PCSC_TransactionBegin(f.table, &a) == SCARD_S_SUCCESS);
+	CHECK(PCSC_TransactionEnd(f.table, &a, SCARD_UNPOWER_CARD) == SCARD_S_SUCCESS);
+	CHECK(f.fake.lastEnd == 0x101);
+	CHECK(f.fake.lastEndDisposition == SCARD_UNPOWER_CARD);
 
 	PCSC_TransactionHandleUninit(f.table, &a);
 	PCSC_TransactionHandleUninit(f.table, &b);
@@ -408,7 +507,7 @@ static BOOL test_end_with_reset_forwards_even_without_lock(void)
 	return TRUE;
 }
 
-static BOOL test_disconnect_drops_lock_ownership(void)
+static BOOL test_disconnect_drops_transaction(void)
 {
 	fixture f;
 	PCSC_TRANSACTION_HANDLE a;
@@ -426,8 +525,9 @@ static BOOL test_disconnect_drops_lock_ownership(void)
 	f.fake.lockOwner[1] = 0;
 	CHECK(f.fake.endCalls == 0);
 
-	/* B must not try to hand over from the dead handle */
+	/* B neither waits for the dead handle nor tries to release its lock */
 	CHECK(PCSC_TransactionBegin(f.table, &b) == SCARD_S_SUCCESS);
+	CHECK(f.fake.sleepCalls == 0);
 	CHECK(PCSC_TransactionAcquire(f.table, &b) == SCARD_S_SUCCESS);
 	CHECK(f.fake.endCalls == 0);
 	CHECK(f.fake.lockOwner[1] == 0x102);
@@ -468,22 +568,6 @@ int TestSmartCardPcscTransaction(int argc, char* argv[])
 	WINPR_UNUSED(argc);
 	WINPR_UNUSED(argv);
 
-	if (!test_nested_transaction_releases_on_outermost_end())
-		return -1;
-	if (!test_end_with_reset_forwards_even_without_lock())
-		return -1;
-	if (!test_disconnect_drops_lock_ownership())
-		return -1;
-
-	if (!test_our_handles_hand_over_lock_without_waiting())
-		return -1;
-	if (!test_different_readers_lock_independently())
-		return -1;
-	if (!test_waits_for_foreign_holder_to_release())
-		return -1;
-	if (!test_gives_up_on_foreign_holder_after_timeout())
-		return -1;
-
 	if (!test_begin_does_not_touch_pcsc())
 		return -1;
 	if (!test_io_outside_transaction_does_not_lock())
@@ -493,6 +577,24 @@ int TestSmartCardPcscTransaction(int argc, char* argv[])
 	if (!test_end_releases_lock_with_disposition())
 		return -1;
 	if (!test_unbalanced_end_is_rejected())
+		return -1;
+	if (!test_begin_waits_for_holder_in_other_context())
+		return -1;
+	if (!test_idle_holder_in_other_context_is_taken_over())
+		return -1;
+	if (!test_begin_waits_for_holder_in_same_context())
+		return -1;
+	if (!test_different_readers_lock_independently())
+		return -1;
+	if (!test_waits_for_foreign_holder_to_release())
+		return -1;
+	if (!test_gives_up_on_foreign_holder_after_timeout())
+		return -1;
+	if (!test_end_with_reset_forwards_even_without_lock())
+		return -1;
+	if (!test_disconnect_drops_transaction())
+		return -1;
+	if (!test_nested_transaction_releases_on_outermost_end())
 		return -1;
 
 	return 0;

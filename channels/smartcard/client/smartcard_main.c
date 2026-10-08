@@ -70,6 +70,101 @@ static SMARTCARD_DEVICE* cast_device_from(DEVICE* device, const char* fkt, const
 	return (SMARTCARD_DEVICE*)device;
 }
 
+/* Execute a queued IRP and complete it. Frees the element. */
+static UINT smartcard_context_process_element(SMARTCARD_DEVICE* smartcard,
+                                              scard_irp_queue_element* element)
+{
+	BOOL handled = FALSE;
+
+	WINPR_ASSERT(smartcard);
+	WINPR_ASSERT(element);
+
+	const LONG status = smartcard_irp_device_control_call(
+	    smartcard->callctx, element->irp->output, &element->irp->IoStatus, &element->operation);
+	if (status)
+	{
+		element->irp->Discard(element->irp);
+		smartcard_operation_free(&element->operation, TRUE);
+		WLog_ERR(TAG, "smartcard_irp_device_control_call failed with error %s [%" PRId32 "]",
+		         NtStatus2Tag(status), status);
+		return (UINT)status;
+	}
+
+	const UINT error = smartcard_complete_irp(smartcard, element->irp, &handled);
+	if (!handled)
+		element->irp->Discard(element->irp);
+	smartcard_operation_free(&element->operation, TRUE);
+
+	if (error)
+		WLog_ERR(TAG, "smartcard_complete_irp failed with %s [%" PRIu32 "]",
+		         WTSErrorToString(error), error);
+	return error;
+}
+
+typedef struct
+{
+	SMARTCARD_CONTEXT* pContext;
+	scard_irp_queue_element* element;
+} scard_begin_transaction_job;
+
+static DWORD WINAPI smartcard_begin_transaction_thread(LPVOID arg)
+{
+	scard_begin_transaction_job* job = arg;
+	SMARTCARD_CONTEXT* pContext = job->pContext;
+
+	const UINT error = smartcard_context_process_element(pContext->smartcard, job->element);
+	free(job);
+
+	EnterCriticalSection(&pContext->beginTransactionLock);
+	if (--pContext->beginTransactionsPending == 0)
+		(void)SetEvent(pContext->beginTransactionsDone);
+	LeaveCriticalSection(&pContext->beginTransactionLock);
+
+	ExitThread(error);
+	return error;
+}
+
+/**
+ * SCardBeginTransaction blocks until every other handle of the reader has
+ * ended its transaction. Those handles may belong to this very context, and
+ * their SCardEndTransaction would then be queued behind the blocked call on
+ * this context's thread, so run the call on a thread of its own instead.
+ * Returns FALSE if no thread could be started; the caller then handles the
+ * IRP inline.
+ */
+static BOOL smartcard_context_start_begin_transaction(SMARTCARD_CONTEXT* pContext,
+                                                      scard_irp_queue_element* element)
+{
+	WINPR_ASSERT(pContext);
+	WINPR_ASSERT(element);
+
+	scard_begin_transaction_job* job = calloc(1, sizeof(scard_begin_transaction_job));
+	if (!job)
+		return FALSE;
+	job->pContext = pContext;
+	job->element = element;
+
+	EnterCriticalSection(&pContext->beginTransactionLock);
+	if (pContext->beginTransactionsPending++ == 0)
+		(void)ResetEvent(pContext->beginTransactionsDone);
+	LeaveCriticalSection(&pContext->beginTransactionLock);
+
+	HANDLE thread = CreateThread(nullptr, 0, smartcard_begin_transaction_thread, job, 0, nullptr);
+	if (thread)
+	{
+		(void)CloseHandle(thread);
+		return TRUE;
+	}
+
+	WLog_WARN(TAG, "CreateThread for SCardBeginTransaction failed, handling it inline");
+	EnterCriticalSection(&pContext->beginTransactionLock);
+	if (--pContext->beginTransactionsPending == 0)
+		(void)SetEvent(pContext->beginTransactionsDone);
+	LeaveCriticalSection(&pContext->beginTransactionLock);
+	free(job);
+	return FALSE;
+}
+
 static DWORD WINAPI smartcard_context_thread(LPVOID arg)
 {
 	SMARTCARD_CONTEXT* pContext = (SMARTCARD_CONTEXT*)arg;
@@ -121,34 +216,15 @@ static DWORD WINAPI smartcard_context_thread(LPVOID arg)
 
 			if (element)
 			{
-				BOOL handled = FALSE;
 				WINPR_ASSERT(smartcard);
 
-				const LONG status =
-				    smartcard_irp_device_control_call(smartcard->callctx, element->irp->output,
-				                                      &element->irp->IoStatus, &element->operation);
-				if (status)
-				{
-					element->irp->Discard(element->irp);
-					smartcard_operation_free(&element->operation, TRUE);
-					WLog_ERR(TAG,
-					         "smartcard_irp_device_control_call failed with error %s [%" PRId32 "]",
-					         NtStatus2Tag(status), status);
-					error = (UINT)status;
-					break;
-				}
+				if ((element->operation.ioControlCode == SCARD_IOCTL_BEGINTRANSACTION) &&
+				    smartcard_context_start_begin_transaction(pContext, element))
+					continue;
 
-				error = smartcard_complete_irp(smartcard, element->irp, &handled);
-				if (!handled)
-					element->irp->Discard(element->irp);
-				smartcard_operation_free(&element->operation, TRUE);
-
+				error = smartcard_context_process_element(smartcard, element);
 				if (error)
-				{
-					WLog_ERR(TAG, "smartcard_complete_irp failed with %s [%" PRIu32 "]",
-					         WTSErrorToString(error), error);
 					break;
-				}
 			}
 		}
 	}
@@ -190,6 +266,13 @@ static void* smartcard_context_new(void* smartcard, SCARDCONTEXT hContext)
 
 	pContext->smartcard = smartcard;
 	pContext->hContext = hContext;
+	InitializeCriticalSection(&pContext->beginTransactionLock);
+	pContext->beginTransactionsDone = CreateEvent(nullptr, TRUE, TRUE, nullptr);
+	if (!pContext->beginTransactionsDone)
+	{
+		WLog_ERR(TAG, "CreateEvent failed!");
+		goto fail;
+	}
 	pContext->IrpQueue = MessageQueue_New(nullptr);
 
 	if (!pContext->IrpQueue)
@@ -241,6 +324,16 @@ void smartcard_context_free(void* pCtx)
 		}
 		MessageQueue_Free(pContext->IrpQueue);
 	}
+
+	/* SCardBeginTransaction IRPs still running on their own threads use the context */
+	if (pContext->beginTransactionsDone)
+	{
+		if (WaitForSingleObject(pContext->beginTransactionsDone, INFINITE) == WAIT_FAILED)
+			WLog_ERR(TAG, "WaitForSingleObject failed with error %" PRIu32 "!", GetLastError());
+		(void)CloseHandle(pContext->beginTransactionsDone);
+	}
+	DeleteCriticalSection(&pContext->beginTransactionLock);
+
 	smartcard_call_release_context(pContext->smartcard->callctx, pContext->hContext);
 	free(pContext);
 }
