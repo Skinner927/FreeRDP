@@ -138,6 +138,30 @@ static void handle_unref(PCSC_TRANSACTION_HANDLE* handle)
 	free(handle);
 }
 
+PCSC_TRANSACTION_HANDLE* PCSC_TransactionHandleRef(PCSC_TRANSACTION_TABLE* table,
+                                                   PCSC_TRANSACTION_HANDLE* handle)
+{
+	WINPR_ASSERT(table);
+	if (!handle)
+		return nullptr;
+
+	EnterCriticalSection(&table->lock);
+	handle->refs++;
+	LeaveCriticalSection(&table->lock);
+	return handle;
+}
+
+void PCSC_TransactionHandleUnref(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle)
+{
+	WINPR_ASSERT(table);
+	if (!handle)
+		return;
+
+	EnterCriticalSection(&table->lock);
+	handle_unref(handle);
+	LeaveCriticalSection(&table->lock);
+}
+
 /* Must be called with the table lock held */
 static pcsc_reader_transaction* reader_transaction(PCSC_TRANSACTION_TABLE* table,
                                                    const char* szReader, BOOL create)

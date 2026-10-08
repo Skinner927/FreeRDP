@@ -629,14 +629,37 @@ static SCARDCONTEXT PCSC_GetCardContextFromHandle(SCARDHANDLE hCard)
 	return pCard->hSharedContext;
 }
 
+/* The transaction state of a card handle, referenced. SCardBeginTransaction may
+ * wait on it on a thread of its own while SCardDisconnect frees the card handle
+ * record on another, so take the reference while the record cannot go away and
+ * drop it with PCSC_TransactionHandleUnref afterwards. */
+WINPR_ATTR_NODISCARD
+static PCSC_TRANSACTION_HANDLE* PCSC_RefCardTransaction(SCARDHANDLE hCard)
+{
+	PCSC_TRANSACTION_HANDLE* transaction = nullptr;
+
+	if (!init())
+		return nullptr;
+
+	ListDictionary_Lock(g_CardHandles);
+	PCSC_SCARDHANDLE* pCard = ListDictionary_GetItemValue(g_CardHandles, (void*)hCard);
+	if (pCard)
+		transaction = PCSC_TransactionHandleRef(g_Transactions, pCard->transaction);
+	ListDictionary_Unlock(g_CardHandles);
+	return transaction;
+}
+
 /* Card I/O inside a transaction takes the reader lock first, see
  * smartcard_pcsc_transaction.h */
 WINPR_ATTR_NODISCARD
-static LONG PCSC_AcquireCardAccess(PCSC_SCARDHANDLE* pCard)
+static LONG PCSC_AcquireCardAccess(SCARDHANDLE hCard)
 {
-	WINPR_ASSERT(pCard);
+	PCSC_TRANSACTION_HANDLE* transaction = PCSC_RefCardTransaction(hCard);
+	if (!transaction)
+		return SCARD_E_INVALID_HANDLE;
 
-	const PCSC_LONG status = PCSC_TransactionAcquire(g_Transactions, pCard->transaction);
+	const PCSC_LONG status = PCSC_TransactionAcquire(g_Transactions, transaction);
+	PCSC_TransactionHandleUnref(g_Transactions, transaction);
 	return PCSC_MapErrorCodeToWinSCard(status);
 }
 
@@ -1910,7 +1933,7 @@ WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardReconnect(SCARDHANDLE hCard, D
 	if (!pCard)
 		return SCARD_E_INVALID_HANDLE;
 
-	const LONG acquired = PCSC_AcquireCardAccess(pCard);
+	const LONG acquired = PCSC_AcquireCardAccess(hCard);
 	if (acquired != SCARD_S_SUCCESS)
 		return acquired;
 
@@ -1943,27 +1966,29 @@ WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardDisconnect(SCARDHANDLE hCard, 
 
 WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardBeginTransaction(SCARDHANDLE hCard)
 {
-	PCSC_SCARDHANDLE* pCard = PCSC_GetCardHandleData(hCard);
+	PCSC_TRANSACTION_HANDLE* transaction = PCSC_RefCardTransaction(hCard);
 
-	if (!pCard)
+	if (!transaction)
 		return SCARD_E_INVALID_HANDLE;
 
 	/* Emulated, see smartcard_pcsc_transaction.h: the reader lock is taken by
 	 * the first card access inside the transaction */
-	const PCSC_LONG status = PCSC_TransactionBegin(g_Transactions, pCard->transaction);
+	const PCSC_LONG status = PCSC_TransactionBegin(g_Transactions, transaction);
+	PCSC_TransactionHandleUnref(g_Transactions, transaction);
 	return PCSC_MapErrorCodeToWinSCard(status);
 }
 
 WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardEndTransaction(SCARDHANDLE hCard,
                                                                  DWORD dwDisposition)
 {
-	PCSC_SCARDHANDLE* pCard = PCSC_GetCardHandleData(hCard);
+	PCSC_TRANSACTION_HANDLE* transaction = PCSC_RefCardTransaction(hCard);
 
-	if (!pCard)
+	if (!transaction)
 		return SCARD_E_INVALID_HANDLE;
 
 	const PCSC_LONG status =
-	    PCSC_TransactionEnd(g_Transactions, pCard->transaction, (PCSC_DWORD)dwDisposition);
+	    PCSC_TransactionEnd(g_Transactions, transaction, (PCSC_DWORD)dwDisposition);
+	PCSC_TransactionHandleUnref(g_Transactions, transaction);
 	return PCSC_MapErrorCodeToWinSCard(status);
 }
 
@@ -2003,7 +2028,7 @@ WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardStatus_Internal(
 	if (!pCard)
 		return SCARD_E_INVALID_VALUE;
 
-	const LONG acquired = PCSC_AcquireCardAccess(pCard);
+	const LONG acquired = PCSC_AcquireCardAccess(hCard);
 	if (acquired != SCARD_S_SUCCESS)
 		return acquired;
 	hContext = PCSC_GetCardContextFromHandle(hCard);
@@ -2163,7 +2188,7 @@ WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardState(SCARDHANDLE hCard, LPDWO
 	if (!pCard)
 		return SCARD_E_INVALID_VALUE;
 
-	const LONG acquired = PCSC_AcquireCardAccess(pCard);
+	const LONG acquired = PCSC_AcquireCardAccess(hCard);
 	if (acquired != SCARD_S_SUCCESS)
 		return acquired;
 	hContext = PCSC_GetCardContextFromHandle(hCard);
@@ -2238,7 +2263,7 @@ WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardTransmit(
 	if (!pCard)
 		return SCARD_E_INVALID_VALUE;
 
-	const LONG acquired = PCSC_AcquireCardAccess(pCard);
+	const LONG acquired = PCSC_AcquireCardAccess(hCard);
 	if (acquired != SCARD_S_SUCCESS)
 		return acquired;
 
@@ -2366,7 +2391,7 @@ WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardControl(SCARDHANDLE hCard, DWO
 	if (!pCard)
 		return SCARD_E_INVALID_VALUE;
 
-	const LONG acquired = PCSC_AcquireCardAccess(pCard);
+	const LONG acquired = PCSC_AcquireCardAccess(hCard);
 	if (acquired != SCARD_S_SUCCESS)
 		return acquired;
 	/**
@@ -2433,7 +2458,7 @@ WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardGetAttrib_Internal(SCARDHANDLE
 	if (!pCard)
 		return SCARD_E_INVALID_VALUE;
 
-	const LONG acquired = PCSC_AcquireCardAccess(pCard);
+	const LONG acquired = PCSC_AcquireCardAccess(hCard);
 	if (acquired != SCARD_S_SUCCESS)
 		return acquired;
 	hContext = PCSC_GetCardContextFromHandle(hCard);
@@ -2874,7 +2899,7 @@ WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardSetAttrib(SCARDHANDLE hCard, D
 	if (!pCard)
 		return SCARD_E_INVALID_VALUE;
 
-	const LONG acquired = PCSC_AcquireCardAccess(pCard);
+	const LONG acquired = PCSC_AcquireCardAccess(hCard);
 	if (acquired != SCARD_S_SUCCESS)
 		return acquired;
 	status = g_PCSC.pfnSCardSetAttrib(hCard, pcsc_dwAttrId, pbAttr, pcsc_cbAttrLen);

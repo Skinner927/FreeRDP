@@ -638,6 +638,30 @@ static BOOL test_waiting_begin_proceeds_when_holder_is_closed(void)
 	return TRUE;
 }
 
+static BOOL test_reference_outlives_close(void)
+{
+	fixture f;
+	PCSC_TRANSACTION_HANDLE* a = nullptr;
+	CHECK(fixture_init(&f));
+	CHECK((a = PCSC_TransactionHandleNew(0x101, "Reader 1")) != nullptr);
+	CHECK(PCSC_TransactionBegin(f.table, a) == SCARD_S_SUCCESS);
+	CHECK(PCSC_TransactionAcquire(f.table, a) == SCARD_S_SUCCESS);
+
+	/* a caller looked the handle up and holds a reference while SCardDisconnect
+	 * closes it: the state stays valid, calls on it fail cleanly */
+	CHECK(PCSC_TransactionHandleRef(f.table, a) == a);
+	PCSC_TransactionHandleClose(f.table, a);
+	CHECK(f.fake.lockOwner[1] == 0x101); /* pcscd releases it, not us */
+	CHECK(PCSC_TransactionBegin(f.table, a) == SCARD_E_INVALID_HANDLE);
+	CHECK(PCSC_TransactionAcquire(f.table, a) == SCARD_E_INVALID_HANDLE);
+	CHECK(PCSC_TransactionEnd(f.table, a, SCARD_LEAVE_CARD) == SCARD_E_INVALID_HANDLE);
+	CHECK(f.fake.endCalls == 0);
+	PCSC_TransactionHandleUnref(f.table, a);
+
+	fixture_uninit(&f);
+	return TRUE;
+}
+
 int TestSmartCardPcscTransaction(int argc, char* argv[])
 {
 	WINPR_UNUSED(argc);
@@ -674,6 +698,8 @@ int TestSmartCardPcscTransaction(int argc, char* argv[])
 	if (!test_waiting_begin_fails_when_its_handle_is_closed())
 		return -1;
 	if (!test_waiting_begin_proceeds_when_holder_is_closed())
+		return -1;
+	if (!test_reference_outlives_close())
 		return -1;
 
 	return 0;

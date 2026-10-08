@@ -95,6 +95,12 @@ PCSC_TRANSACTION_HANDLE* PCSC_TransactionHandleNew(SCARDHANDLE hCard, const char
  *  reader lock itself), fail waiting callers with SCARD_E_INVALID_HANDLE and
  *  release the state once the last of them has returned */
 void PCSC_TransactionHandleClose(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle);
+/** Keep the state alive across a concurrent PCSC_TransactionHandleClose: take
+ *  the reference while whatever maps the card handle to its state is locked,
+ *  drop it after the call. Returns handle. */
+PCSC_TRANSACTION_HANDLE* PCSC_TransactionHandleRef(PCSC_TRANSACTION_TABLE* table,
+                                                   PCSC_TRANSACTION_HANDLE* handle);
+void PCSC_TransactionHandleUnref(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle);
 
 /** SCardBeginTransaction: waits for another of our handles, never calls pcsc-lite */
 PCSC_LONG PCSC_TransactionBegin(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle);
