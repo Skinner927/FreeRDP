@@ -37,6 +37,10 @@
 
 #define TAG CHANNELS_TAG("smartcard.client")
 
+/* Upper bound of SCardBeginTransaction IRPs executed concurrently per context,
+ * further ones are handled on the context thread */
+#define SMARTCARD_MAX_BEGIN_TRANSACTION_THREADS 32
+
 typedef struct
 {
 	DEVICE device;
@@ -56,7 +60,9 @@ typedef struct
 	SMARTCARD_DEVICE* smartcard;
 
 	/* SCardBeginTransaction IRPs run on threads of their own, see
-	 * smartcard_context_thread. Counted so the context outlives them. */
+	 * smartcard_context_thread. Counted so the context outlives them and so
+	 * a server cannot make us start more than
+	 * SMARTCARD_MAX_BEGIN_TRANSACTION_THREADS of them per context. */
 	CRITICAL_SECTION beginTransactionLock;
 	UINT32 beginTransactionsPending;
 	HANDLE beginTransactionsDone;

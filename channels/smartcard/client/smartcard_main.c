@@ -145,6 +145,14 @@ static BOOL smartcard_context_start_begin_transaction(SMARTCARD_CONTEXT* pContex
 	job->element = element;
 
 	EnterCriticalSection(&pContext->beginTransactionLock);
+	if (pContext->beginTransactionsPending >= SMARTCARD_MAX_BEGIN_TRANSACTION_THREADS)
+	{
+		LeaveCriticalSection(&pContext->beginTransactionLock);
+		WLog_WARN(TAG, "%" PRIu32 " SCardBeginTransaction calls pending, handling this one inline",
+		          pContext->beginTransactionsPending);
+		free(job);
+		return FALSE;
+	}
 	if (pContext->beginTransactionsPending++ == 0)
 		(void)ResetEvent(pContext->beginTransactionsDone);
 	LeaveCriticalSection(&pContext->beginTransactionLock);

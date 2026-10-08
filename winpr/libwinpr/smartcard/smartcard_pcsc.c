@@ -214,7 +214,7 @@ typedef struct
 typedef struct
 {
 	SCARDCONTEXT hSharedContext;
-	PCSC_TRANSACTION_HANDLE transaction;
+	PCSC_TRANSACTION_HANDLE* transaction;
 } PCSC_SCARDHANDLE;
 
 static HMODULE g_PCSCModule = nullptr;
@@ -636,7 +636,7 @@ static LONG PCSC_AcquireCardAccess(PCSC_SCARDHANDLE* pCard)
 {
 	WINPR_ASSERT(pCard);
 
-	const PCSC_LONG status = PCSC_TransactionAcquire(g_Transactions, &pCard->transaction);
+	const PCSC_LONG status = PCSC_TransactionAcquire(g_Transactions, pCard->transaction);
 	return PCSC_MapErrorCodeToWinSCard(status);
 }
 
@@ -648,7 +648,7 @@ static void PCSC_DisconnectCardHandle(PCSC_SCARDHANDLE* pCard)
 	PCSC_SCARDCONTEXT* pContext = PCSC_GetCardContextData(pCard->hSharedContext);
 	if (init())
 	{
-		PCSC_TransactionHandleUninit(g_Transactions, &pCard->transaction);
+		PCSC_TransactionHandleClose(g_Transactions, pCard->transaction);
 		ListDictionary_Remove(g_CardHandles, (void*)pCard);
 	}
 
@@ -683,7 +683,8 @@ static PCSC_SCARDHANDLE* PCSC_ConnectCardHandle(SCARDCONTEXT hSharedContext, SCA
 
 	pCard->hSharedContext = hSharedContext;
 
-	if (!PCSC_TransactionHandleInit(&pCard->transaction, hCard, szReader))
+	pCard->transaction = PCSC_TransactionHandleNew(hCard, szReader);
+	if (!pCard->transaction)
 		goto error;
 
 	if (!ListDictionary_Add(g_CardHandles, (void*)hCard, (void*)pCard))
@@ -692,7 +693,7 @@ static PCSC_SCARDHANDLE* PCSC_ConnectCardHandle(SCARDCONTEXT hSharedContext, SCA
 	pContext->dwCardHandleCount++;
 	return pCard;
 error:
-	PCSC_TransactionHandleUninit(g_Transactions, &pCard->transaction);
+	PCSC_TransactionHandleClose(g_Transactions, pCard->transaction);
 	free(pCard);
 	return nullptr;
 }
@@ -1949,7 +1950,7 @@ WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardBeginTransaction(SCARDHANDLE h
 
 	/* Emulated, see smartcard_pcsc_transaction.h: the reader lock is taken by
 	 * the first card access inside the transaction */
-	const PCSC_LONG status = PCSC_TransactionBegin(g_Transactions, &pCard->transaction);
+	const PCSC_LONG status = PCSC_TransactionBegin(g_Transactions, pCard->transaction);
 	return PCSC_MapErrorCodeToWinSCard(status);
 }
 
@@ -1962,7 +1963,7 @@ WINPR_ATTR_NODISCARD static LONG WINAPI PCSC_SCardEndTransaction(SCARDHANDLE hCa
 		return SCARD_E_INVALID_HANDLE;
 
 	const PCSC_LONG status =
-	    PCSC_TransactionEnd(g_Transactions, &pCard->transaction, (PCSC_DWORD)dwDisposition);
+	    PCSC_TransactionEnd(g_Transactions, pCard->transaction, (PCSC_DWORD)dwDisposition);
 	return PCSC_MapErrorCodeToWinSCard(status);
 }
 

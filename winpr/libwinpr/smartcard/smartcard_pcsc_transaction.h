@@ -78,24 +78,23 @@ typedef struct
 
 typedef struct pcsc_transaction_table PCSC_TRANSACTION_TABLE;
 
-typedef struct
-{
-	SCARDHANDLE hCard;
-	char* szReader;
-	DWORD dwDepth;
-} PCSC_TRANSACTION_HANDLE;
+/** Transaction state of one card handle. Reference counted: a thread waiting
+ *  in PCSC_TransactionBegin or PCSC_TransactionAcquire keeps it alive while
+ *  another thread closes the handle. */
+typedef struct pcsc_transaction_handle PCSC_TRANSACTION_HANDLE;
 
 void PCSC_TransactionTableFree(PCSC_TRANSACTION_TABLE* table);
 
 WINPR_ATTR_MALLOC(PCSC_TransactionTableFree, 1)
 PCSC_TRANSACTION_TABLE* PCSC_TransactionTableNew(const PCSC_TRANSACTION_OPS* ops);
 
-/** Associate a card handle with the pcsc-lite reader name it is connected to */
-BOOL PCSC_TransactionHandleInit(PCSC_TRANSACTION_HANDLE* handle, SCARDHANDLE hCard,
-                                const char* szReader);
-/** Drop any transaction of the handle (pcsc-lite releases the reader lock
- *  itself on SCardDisconnect) and free its resources */
-void PCSC_TransactionHandleUninit(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle);
+/** Create the state of a card handle connected to the pcsc-lite reader szReader */
+WINPR_ATTR_NODISCARD
+PCSC_TRANSACTION_HANDLE* PCSC_TransactionHandleNew(SCARDHANDLE hCard, const char* szReader);
+/** SCardDisconnect: drop any transaction of the handle (pcsc-lite releases the
+ *  reader lock itself), fail waiting callers with SCARD_E_INVALID_HANDLE and
+ *  release the state once the last of them has returned */
+void PCSC_TransactionHandleClose(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle);
 
 /** SCardBeginTransaction: waits for another of our handles, never calls pcsc-lite */
 PCSC_LONG PCSC_TransactionBegin(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle);

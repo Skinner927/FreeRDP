@@ -36,6 +36,20 @@ static PCSC_LONG pcsc_status(PCSC_LONG status)
 	return (PCSC_LONG)(INT32)(UINT32)status;
 }
 
+struct pcsc_transaction_handle
+{
+	SCARDHANDLE hCard;
+	char* szReader;
+	DWORD dwDepth;
+
+	/* The rest is protected by the table lock. A handle may be closed
+	 * (SCardDisconnect) by one thread while another one waits in
+	 * PCSC_TransactionBegin or PCSC_TransactionAcquire on it, so waiters hold
+	 * a reference and the memory lives until the last of them has left. */
+	UINT32 refs;
+	BOOL closed;
+};
+
 /* Transaction state of one pcsc-lite reader */
 typedef struct
 {
@@ -93,18 +107,35 @@ fail:
 	return nullptr;
 }
 
-BOOL PCSC_TransactionHandleInit(PCSC_TRANSACTION_HANDLE* handle, SCARDHANDLE hCard,
-                                const char* szReader)
+PCSC_TRANSACTION_HANDLE* PCSC_TransactionHandleNew(SCARDHANDLE hCard, const char* szReader)
 {
-	WINPR_ASSERT(handle);
-
 	if (!szReader)
-		return FALSE;
+		return nullptr;
+
+	PCSC_TRANSACTION_HANDLE* handle = calloc(1, sizeof(PCSC_TRANSACTION_HANDLE));
+	if (!handle)
+		return nullptr;
 
 	handle->hCard = hCard;
-	handle->dwDepth = 0;
+	handle->refs = 1;
 	handle->szReader = _strdup(szReader);
-	return handle->szReader != nullptr;
+	if (!handle->szReader)
+	{
+		free(handle);
+		return nullptr;
+	}
+	return handle;
+}
+
+/* Must be called with the table lock held */
+static void handle_unref(PCSC_TRANSACTION_HANDLE* handle)
+{
+	WINPR_ASSERT(handle->refs > 0);
+	if (--handle->refs > 0)
+		return;
+
+	free(handle->szReader);
+	free(handle);
 }
 
 /* Must be called with the table lock held */
@@ -178,13 +209,14 @@ static BOOL claim_transaction(PCSC_TRANSACTION_TABLE* table, pcsc_reader_transac
 	return TRUE;
 }
 
-void PCSC_TransactionHandleUninit(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle)
+void PCSC_TransactionHandleClose(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle)
 {
 	WINPR_ASSERT(table);
-	if (!handle || !handle->szReader)
+	if (!handle)
 		return;
 
 	EnterCriticalSection(&table->lock);
+	handle->closed = TRUE;
 	pcsc_reader_transaction* reader = reader_transaction(table, handle->szReader, FALSE);
 	if (reader && reader->owner == handle)
 	{
@@ -192,11 +224,10 @@ void PCSC_TransactionHandleUninit(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTIO
 		reader->owner = nullptr;
 		reader->readerLocked = FALSE;
 	}
+	WLog_DBG(TAG, "[%s] hCard=%p closed%s", handle->szReader, (void*)handle->hCard,
+	         handle->refs > 1 ? ", waiters pending" : "");
+	handle_unref(handle);
 	LeaveCriticalSection(&table->lock);
-
-	free(handle->szReader);
-	handle->szReader = nullptr;
-	handle->dwDepth = 0;
 }
 
 PCSC_LONG PCSC_TransactionBegin(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle)
@@ -204,24 +235,39 @@ PCSC_LONG PCSC_TransactionBegin(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_
 	WINPR_ASSERT(table);
 	WINPR_ASSERT(handle);
 
+	PCSC_LONG status = SCARD_S_SUCCESS;
+	EnterCriticalSection(&table->lock);
+
+	if (handle->closed)
+	{
+		status = SCARD_E_INVALID_HANDLE;
+		goto out;
+	}
+
+	if (handle->dwDepth > 0)
+	{
+		handle->dwDepth++;
+		WLog_DBG(TAG, "[%s] hCard=%p begin nested transaction, depth=%" PRIu32, handle->szReader,
+		         (void*)handle->hCard, handle->dwDepth);
+		goto out;
+	}
+
+	handle->refs++; /* we may wait and the handle may be closed meanwhile */
 	for (;;)
 	{
-		EnterCriticalSection(&table->lock);
-
-		if (handle->dwDepth > 0)
+		if (handle->closed)
 		{
-			handle->dwDepth++;
-			WLog_DBG(TAG, "[%s] hCard=%p begin nested transaction, depth=%" PRIu32,
-			         handle->szReader, (void*)handle->hCard, handle->dwDepth);
-			LeaveCriticalSection(&table->lock);
-			return SCARD_S_SUCCESS;
+			WLog_DBG(TAG, "[%s] hCard=%p closed while waiting to begin a transaction",
+			         handle->szReader, (void*)handle->hCard);
+			status = SCARD_E_INVALID_HANDLE;
+			break;
 		}
 
 		pcsc_reader_transaction* reader = reader_transaction(table, handle->szReader, TRUE);
 		if (!reader)
 		{
-			LeaveCriticalSection(&table->lock);
-			return SCARD_E_NO_MEMORY;
+			status = SCARD_E_NO_MEMORY;
+			break;
 		}
 
 		const UINT64 now = table->ops.tick(table->ops.context);
@@ -230,13 +276,18 @@ PCSC_LONG PCSC_TransactionBegin(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_
 			handle->dwDepth = 1;
 			WLog_DBG(TAG, "[%s] hCard=%p begin transaction", handle->szReader,
 			         (void*)handle->hCard);
-			LeaveCriticalSection(&table->lock);
-			return SCARD_S_SUCCESS;
+			break;
 		}
 
 		LeaveCriticalSection(&table->lock);
 		table->ops.sleep(table->ops.context, PCSC_TRANSACTION_POLL_MS);
+		EnterCriticalSection(&table->lock);
 	}
+	handle_unref(handle);
+
+out:
+	LeaveCriticalSection(&table->lock);
+	return status;
 }
 
 PCSC_LONG PCSC_TransactionEnd(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HANDLE* handle,
@@ -247,6 +298,12 @@ PCSC_LONG PCSC_TransactionEnd(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTION_HA
 
 	PCSC_LONG status = SCARD_S_SUCCESS;
 	EnterCriticalSection(&table->lock);
+
+	if (handle->closed)
+	{
+		status = SCARD_E_INVALID_HANDLE;
+		goto out;
+	}
 
 	if (handle->dwDepth == 0)
 	{
@@ -301,37 +358,53 @@ PCSC_LONG PCSC_TransactionAcquire(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTIO
 	WINPR_ASSERT(table);
 	WINPR_ASSERT(handle);
 
-	if (handle->dwDepth == 0)
-		return SCARD_S_SUCCESS; /* plain shared access, nothing to lock */
-
+	PCSC_LONG status = SCARD_S_SUCCESS;
 	BOOL foreignWait = FALSE;
 	UINT64 foreignSince = 0;
 
+	EnterCriticalSection(&table->lock);
+
+	if (handle->closed)
+	{
+		status = SCARD_E_INVALID_HANDLE;
+		goto out;
+	}
+
+	if (handle->dwDepth == 0)
+		goto out; /* plain shared access, nothing to lock */
+
+	handle->refs++; /* we may wait and the handle may be closed meanwhile */
 	for (;;)
 	{
-		PCSC_LONG status = SCARD_S_SUCCESS;
-		EnterCriticalSection(&table->lock);
+		if (handle->closed)
+		{
+			WLog_DBG(TAG, "[%s] hCard=%p closed while waiting for card access", handle->szReader,
+			         (void*)handle->hCard);
+			status = SCARD_E_INVALID_HANDLE;
+			break;
+		}
 
 		pcsc_reader_transaction* reader = reader_transaction(table, handle->szReader, TRUE);
 		if (!reader)
 		{
-			LeaveCriticalSection(&table->lock);
-			return SCARD_E_NO_MEMORY;
+			status = SCARD_E_NO_MEMORY;
+			break;
 		}
 
 		const UINT64 now = table->ops.tick(table->ops.context);
 		if (!claim_transaction(table, reader, handle, now, "card access"))
 		{
-			/* another context holds the transaction and is using the card */
+			/* another handle holds the transaction and is using the card */
 			LeaveCriticalSection(&table->lock);
 			table->ops.sleep(table->ops.context, PCSC_TRANSACTION_POLL_MS);
+			EnterCriticalSection(&table->lock);
 			continue;
 		}
 
 		if (reader->readerLocked)
 		{
-			LeaveCriticalSection(&table->lock);
-			return SCARD_S_SUCCESS;
+			status = SCARD_S_SUCCESS;
+			break;
 		}
 
 		/* pcsc-lite's SCardBeginTransaction blocks until the lock is free, so
@@ -348,10 +421,8 @@ PCSC_LONG PCSC_TransactionAcquire(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTIO
 			         foreignWait ? " (after waiting for another application)" : "");
 		}
 
-		LeaveCriticalSection(&table->lock);
-
 		if (status != SCARD_E_SHARING_VIOLATION)
-			return status;
+			break;
 
 		if (!foreignWait)
 		{
@@ -366,9 +437,16 @@ PCSC_LONG PCSC_TransactionAcquire(PCSC_TRANSACTION_TABLE* table, PCSC_TRANSACTIO
 			          "[%s] hCard=%p reader locked by another application for %" PRIu32
 			          " ms, giving up",
 			          handle->szReader, (void*)handle->hCard, (UINT32)PCSC_TRANSACTION_WAIT_MS);
-			return SCARD_E_SHARING_VIOLATION;
+			break;
 		}
 
+		LeaveCriticalSection(&table->lock);
 		table->ops.sleep(table->ops.context, PCSC_TRANSACTION_POLL_MS);
+		EnterCriticalSection(&table->lock);
 	}
+	handle_unref(handle);
+
+out:
+	LeaveCriticalSection(&table->lock);
+	return status;
 }
